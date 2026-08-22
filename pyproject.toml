@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "macrorec"
+version = "0.1.0"
+description = "Record, edit and replay keyboard/mouse macros on X11"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Environment :: X11 Applications :: Qt",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = ["python-xlib>=0.33"]
+
+[project.optional-dependencies]
+gui = ["PyQt5"]
+
+[project.scripts]
+macrorec = "macrorec.gui:main"
+
+[tool.setuptools.packages.find]
+include = ["macrorec*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

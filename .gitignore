@@ -1,0 +1,23 @@
+# Private planning docs, not for publication. End users care about the product,
+# not how it got built.
+docs/TODO.md
+docs/PLAN.md
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.hypothesis/
+*.egg-info/
+
+# Project-local venv (must be created with --system-site-packages so PyQt5/PIL stay visible)
+.venv/
+venv/
+
+# Test artifacts
+/tests/_out/
+*.xwd
+
+# Local tooling config, not part of the project
+.claude/
+.mcp.json

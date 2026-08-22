@@ -1,0 +1,9 @@
+# Runtime dependencies. Kept in step with pyproject.toml by
+# tests/test_bootstrap.py, which fails if the two disagree.
+#
+# The venv is created with --system-site-packages, so a distribution-packaged
+# PyQt5 (python3-pyqt5 on Debian and Ubuntu, python-pyqt5 on Arch) satisfies
+# the requirement and nothing is downloaded for it. Without one, pip installs
+# it from PyPI.
+python-xlib>=0.33
+PyQt5>=5.15
