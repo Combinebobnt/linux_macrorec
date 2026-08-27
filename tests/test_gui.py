@@ -10,9 +10,11 @@ import time
 import pytest
 
 from macrorec.backend.fake import FakePlayer, FakeRecorder
-from macrorec.events import Click, KeyDown, KeyTap, KeyUp, Move, Sleep
+from macrorec.collapse import merge_sleeps
+from macrorec.events import Click, KeyDown, KeyTap, KeyUp, Move, MoveRel, Sleep
 from macrorec.script import format_macro, parse
 from macrorec.settings import Settings
+from macrorec.timeline import build_schedule
 
 pytest.importorskip("PyQt5", reason="PyQt5 is not installed")
 
@@ -69,9 +71,14 @@ class FakeGrab:
 @pytest.fixture
 def window(qapp, tmp_path):
     """A window with fake backends. `harness` collects what they were handed."""
-    harness = {"players": [], "recorders": [], "grabs": [], "warnings": []}
+    harness = {
+        "players": [], "recorders": [], "grabs": [], "game_grabs": [],
+        "warnings": [], "recorder_capture_raw_input": [],
+        "panic_key_is_withheld": [],
+    }
 
-    def recorder_factory():
+    def recorder_factory(capture_raw_input):
+        harness["recorder_capture_raw_input"].append(capture_raw_input)
         recorder = FakeRecorder(harness.get("script", []))
         harness["recorders"].append(recorder)
         return recorder
@@ -86,13 +93,20 @@ def window(qapp, tmp_path):
         harness["grabs"].append(grab)
         return grab
 
+    def game_grab_factory():
+        grab = FakeGrab()
+        harness["game_grabs"].append(grab)
+        return grab
+
     win = gui.MacroRecWindow(
         Settings(),
         recorder_factory=recorder_factory,
         player_factory=player_factory,
         grab_factory=grab_factory,
-        warnings_factory=lambda macro, panic: (
+        game_grab_factory=game_grab_factory,
+        warnings_factory=lambda macro, panic, panic_key_is_withheld: (
             harness.setdefault("warned_about", []).append(panic)
+            or harness["panic_key_is_withheld"].append(panic_key_is_withheld)
             or harness["warnings"]),
         settings_path=str(tmp_path / "settings.json"),
     )
@@ -181,6 +195,353 @@ def test_recording_collapses_motion_and_becomes_the_macro(window, qapp):
     assert Move(9, 9) in kinds and Move(1, 1) not in kinds, "motion collapsed"
     assert any(isinstance(e, Sleep) for e in kinds), "timing preserved"
     assert win.play_button.isEnabled()
+
+
+def test_a_fast_stroke_keeps_its_duration_in_the_default_mode(window, qapp):
+    """The reported defect, through the window rather than the functions. The other
+    collapse tests space their moves 100ms apart, so they pass whether or not
+    sub-threshold gaps survive; XRecord really delivers motion every 1-3ms."""
+    win, harness = window
+    harness["script"] = ([(i * 0.002, Move(i, i)) for i in range(300)]
+                         + [(0.600, Click("left"))])
+    win.start_recording()
+    assert pump(qapp, lambda: len(win._captured) >= 301)
+    win.stop()
+    qapp.processEvents()
+
+    events = win.macro.events
+    assert [e for e in events if not isinstance(e, Sleep)] == [
+        Move(299, 299), Click("left"),
+    ], "still collapsed to the endpoint"
+    assert sum(isinstance(e, Sleep) for e in events) == 2, (
+        "0.6s written as travel-then-dwell, not as 120 sleep lines"
+    )
+    assert build_schedule(events).duration == pytest.approx(0.6, abs=0.01)
+
+
+def test_path_capture_keeps_the_intermediate_moves(window, qapp):
+    """With the preference on, the route is the point: the moves a collapsed
+    recording throws away are exactly the ones that have to survive."""
+    win, harness = window
+    win.settings.capture_motion_path = True
+    harness["script"] = [
+        (0.00, Move(1, 1)), (0.05, Move(5, 5)), (0.10, Move(9, 9)),
+        (0.15, Click("left")),
+    ]
+    win.start_recording()
+    assert pump(qapp, lambda: len(win._captured) >= 4)
+    win.stop()
+    qapp.processEvents()
+
+    kinds = win.macro.events
+    assert Move(1, 1) in kinds and Move(5, 5) in kinds and Move(9, 9) in kinds
+    assert any(isinstance(e, Sleep) for e in kinds), "timing preserved"
+
+
+def test_path_capture_thins_motion_at_the_real_capture_rate(window, qapp):
+    """The other path-capture tests space their moves well over the sample interval,
+    so they would pass even if sampling did nothing. XRecord really delivers motion
+    every 1-3ms, and this is what fails if the sampling is ever moved to after
+    to_events, where the sub-5ms gaps have already been thrown away."""
+    win, harness = window
+    win.settings.capture_motion_path = True
+    harness["script"] = ([(i * 0.002, Move(i, i)) for i in range(100)]
+                         + [(0.20, Click("left"))])
+    win.start_recording()
+    assert pump(qapp, lambda: len(win._captured) >= 101)
+    win.stop()
+    qapp.processEvents()
+
+    moves = [e for e in win.macro.events if isinstance(e, Move)]
+    assert 2 < len(moves) < 100, "thinned, but still a path"
+
+    offsets = [step.at for step in build_schedule(win.macro.events)]
+    assert offsets == sorted(offsets)
+    assert len(set(offsets)) > 2, "the stroke is spread over time, not all at once"
+
+
+def test_path_capture_is_off_unless_asked_for(window, qapp):
+    """The same script, with the default settings, still collapses."""
+    win, harness = window
+    assert win.settings.capture_motion_path is False
+    harness["script"] = [
+        (0.00, Move(1, 1)), (0.05, Move(5, 5)), (0.10, Move(9, 9)),
+        (0.15, Click("left")),
+    ]
+    win.start_recording()
+    assert pump(qapp, lambda: len(win._captured) >= 4)
+    win.stop()
+    qapp.processEvents()
+
+    assert Move(1, 1) not in win.macro.events
+
+
+def test_path_capture_trims_the_whole_walk_to_our_stop_button(window, qapp):
+    """Trimming the last move only removes one sample of the approach. The rest of
+    the run would leave every path-captured macro ending by dragging the pointer
+    onto the transport bar."""
+    win, harness = window
+    win.settings.capture_motion_path = True
+    win.move(100, 100)
+    qapp.processEvents()
+    rect = win.frameGeometry()
+    inside = rect.center()
+    outside = (rect.right() + 400, rect.bottom() + 400)
+
+    harness["script"] = [
+        (0.00, KeyTap("a")),
+        (0.05, Move(*outside)),
+        (0.10, Move(inside.x() - 4, inside.y() - 4)),
+        (0.15, Move(inside.x() - 2, inside.y() - 2)),
+        (0.20, Move(inside.x(), inside.y())),
+        (0.25, Click("left")),
+    ]
+    win.start_recording()
+    assert pump(qapp, lambda: len(win._captured) >= 6)
+    win.stop_button.click()
+    qapp.processEvents()
+
+    kinds = win.macro.events
+    assert Move(*outside) in kinds, "motion outside our window is the user's"
+    for point in ((inside.x() - 4, inside.y() - 4), (inside.x() - 2, inside.y() - 2),
+                  (inside.x(), inside.y())):
+        assert Move(*point) not in kinds, f"{point} walked to Stop, should be gone"
+    assert Click("left") not in kinds
+
+
+def test_path_capture_leaves_an_earlier_click_over_our_window_alone(window, qapp):
+    """The walk-back stops at the first move outside our rect, so it only eats the
+    approach contiguous with the click that ended the recording. A macro that
+    genuinely clicks over this window earlier on keeps that."""
+    win, harness = window
+    win.settings.capture_motion_path = True
+    win.move(100, 100)
+    qapp.processEvents()
+    rect = win.frameGeometry()
+    inside = rect.center()
+    outside = (rect.right() + 400, rect.bottom() + 400)
+
+    harness["script"] = [
+        (0.00, Move(inside.x() - 6, inside.y() - 6)),
+        (0.05, Click("right")),
+        (0.10, Move(*outside)),
+        (0.15, Move(inside.x(), inside.y())),
+        (0.20, Click("left")),
+    ]
+    win.start_recording()
+    assert pump(qapp, lambda: len(win._captured) >= 5)
+    win.stop_button.click()
+    qapp.processEvents()
+
+    kinds = win.macro.events
+    assert Move(inside.x() - 6, inside.y() - 6) in kinds
+    assert Click("right") in kinds
+    assert Move(*outside) in kinds
+    assert Move(inside.x(), inside.y()) not in kinds
+
+
+# --- M2: capture_raw_input, moverel and the game-mode panic grab -------------
+
+
+def test_recording_asks_for_the_raw_backend_when_the_setting_is_on(window, qapp):
+    win, harness = window
+    win.settings.capture_raw_input = True
+    win.start_recording()
+    qapp.processEvents()
+    win.stop()
+    qapp.processEvents()
+    assert harness["recorder_capture_raw_input"] == [True]
+
+
+def test_recording_asks_for_the_ordinary_backend_by_default(window, qapp):
+    win, harness = window
+    win.start_recording()
+    qapp.processEvents()
+    win.stop()
+    qapp.processEvents()
+    assert harness["recorder_capture_raw_input"] == [False]
+
+
+def test_raw_capture_sums_deltas_instead_of_collapsing_them(window, qapp):
+    """MoveRel must go through accumulate_motion, never collapse_motion: collapsing
+    a run of deltas to its last one would silently discard the rest of the turn -
+    the exact failure AGENTS.md warns path capture could reproduce if the ordering
+    were ever gotten backwards."""
+    win, harness = window
+    win.settings.capture_raw_input = True
+    harness["script"] = [
+        (0.00, MoveRel(3, -1)), (0.01, MoveRel(4, -1)), (0.02, MoveRel(5, -1)),
+        (0.03, Click("left")),
+    ]
+    win.start_recording()
+    assert pump(qapp, lambda: len(win._captured) >= 4)
+    win.stop()
+    qapp.processEvents()
+
+    moves = [e for e in win.macro.events if isinstance(e, MoveRel)]
+    assert moves, "collapsed away instead of summed"
+    assert sum(m.dx for m in moves) == 12
+    assert sum(m.dy for m in moves) == -3
+
+
+def test_playback_arms_the_game_grab_when_raw_capture_is_on(window, qapp):
+    """A game's own exclusive keyboard grab would block HotkeyGrab's XGrabKey,
+    so the panic stop has to move to the XI2 watcher while capture_raw_input is
+    on - gated on the setting, per AGENTS.md, not unconditional."""
+    win, harness = window
+    win.settings.capture_raw_input = True
+    win.macro = parse("key a\nsleep 3s\nkey b\n")
+    win._refresh()
+    win.start_playback()
+
+    assert pump(qapp, lambda: win.mode == gui.PLAYING)
+    assert harness["game_grabs"], "the game grab factory was never used"
+    assert win._grab is harness["game_grabs"][-1], (
+        "the window must be holding the game grab, not some other one")
+    assert win._grab.started and win._grab.syms == ["Escape"]
+
+    win.stop()
+    assert pump(qapp, lambda: win.mode == gui.IDLE)
+
+
+def test_playback_uses_the_ordinary_grab_by_default(window, qapp):
+    win, harness = window
+    assert win.settings.capture_raw_input is False
+    win.macro = parse("key a\nsleep 3s\nkey b\n")
+    win._refresh()
+    win.start_playback()
+
+    assert pump(qapp, lambda: win.mode == gui.PLAYING)
+    assert harness["grabs"] and win._grab is harness["grabs"][-1]
+    assert win._grab.started
+    assert not harness["game_grabs"]
+
+    win.stop()
+    assert pump(qapp, lambda: win.mode == gui.IDLE)
+
+
+def test_recording_still_uses_the_ordinary_grab_even_with_raw_capture_on(window, qapp):
+    """capture_raw_input only moves the panic grab to XI2 during PLAYING - Record
+    and Play hotkeys never need to survive a game's grab, since they are pressed
+    before the game has one."""
+    win, harness = window
+    win.settings.capture_raw_input = True
+    win.settings.record_key = "F9"
+    win._rebind_hotkeys()
+    assert harness["grabs"] and harness["grabs"][-1].started
+    assert not harness["game_grabs"]
+
+
+def test_raw_capture_withholds_nothing_from_the_panic_key(window, qapp):
+    """With capture_raw_input on, RawHotkeyWatch filters its own injected keys by
+    sourceid instead of warn-and-skip withholding them, so the panic key plays
+    back like any other key and there is nothing to warn about - see AGENTS.md."""
+    win, harness = window
+    win.settings.capture_raw_input = True
+    win.macro = parse("key Escape\n")
+    win._refresh()
+    win.start_playback()
+
+    assert pump(qapp, lambda: win.mode == gui.IDLE)
+    player = harness["players"][0]
+    assert player.skip_syms == set(), "the panic key must not be withheld"
+    assert ("key_down", "Escape") in player.calls
+    assert harness["panic_key_is_withheld"][-1] is False
+    assert harness["warnings"] == []
+
+
+def test_ordinary_playback_still_withholds_the_panic_key(window, qapp):
+    win, harness = window
+    assert win.settings.capture_raw_input is False
+    win.macro = parse("key Escape\n")
+    win._refresh()
+    win.start_playback()
+
+    assert pump(qapp, lambda: win.mode == gui.IDLE)
+    assert harness["players"][0].skip_syms == {"Escape"}
+    assert harness["panic_key_is_withheld"][-1] is True
+
+
+def test_playback_survives_a_game_grab_that_fails_to_arm(window, qapp, monkeypatch):
+    """Fail-closed, seen from the GUI: if RawHotkeyWatch cannot arm (here
+    standing in for a discovery failure), playback still starts, the failure is
+    reported instead of raised, and no grab is held - never an unfiltered one."""
+    win, harness = window
+    win.settings.capture_raw_input = True
+
+    def broken():
+        raise RuntimeError("simulated: could not tell injected keys from real ones")
+
+    monkeypatch.setattr(win, "_game_grab_factory", broken)
+    shown = []
+    monkeypatch.setattr(gui.QMessageBox, "warning",
+                        staticmethod(lambda *a, **k: shown.append(a)))
+
+    win.macro = parse("key a\n")
+    win._refresh()
+    win.start_playback()
+
+    assert pump(qapp, lambda: win.mode == gui.IDLE)
+    assert win._grab is None
+    assert shown, "a failed game grab must not be silent"
+
+
+def test_the_raw_input_checkbox_is_seeded_from_settings(qapp):
+    off = gui.SettingsDialog(Settings())
+    assert off.raw_input_check.isChecked() is False
+
+    on = gui.SettingsDialog(Settings(capture_raw_input=True))
+    assert on.raw_input_check.isChecked() is True
+
+
+def test_the_raw_input_checkbox_is_written_back_on_accept(qapp):
+    settings = Settings()
+    dialog = gui.SettingsDialog(settings)
+    dialog.raw_input_check.setChecked(True)
+    dialog.accept()
+    assert dialog.result() == gui.QDialog.Accepted
+    assert settings.capture_raw_input is True
+
+
+def test_default_recorder_picks_the_raw_backend_against_a_real_display(xvfb):
+    """The GUI tests above all go through fakes, which would stay green even if
+    _default_recorder's own wiring to XI2Recorder were wrong. This exercises the
+    factory function itself, relying on the xvfb fixture's $DISPLAY the same way
+    the factory does."""
+    xi2 = pytest.importorskip("macrorec.backend.xi2")
+    recorder = gui._default_recorder(True)
+    try:
+        assert isinstance(recorder, xi2.XI2Recorder)
+        recorder.start(lambda at, event: None)
+        assert recorder.is_recording
+    finally:
+        recorder.stop()
+
+
+def test_default_recorder_picks_the_ordinary_backend_against_a_real_display(xvfb):
+    x11 = pytest.importorskip("macrorec.backend.x11")
+    recorder = gui._default_recorder(False)
+    try:
+        assert isinstance(recorder, x11.X11Recorder)
+        recorder.start(lambda at, event: None)
+        assert recorder.is_recording
+    finally:
+        recorder.stop()
+
+
+def test_default_game_grab_arms_against_a_real_display(xvfb):
+    """Same reasoning as the recorder factory test above: _default_game_grab is
+    never called by any fake-backed test, so its own construction of
+    RawHotkeyWatch() needs its own check."""
+    xi2 = pytest.importorskip("macrorec.backend.xi2")
+    grab = gui._default_game_grab()
+    assert isinstance(grab, xi2.RawHotkeyWatch)
+    try:
+        grab.start({"Escape": lambda: None})
+        assert grab.is_active
+        assert grab.grabbed == ["Escape"]
+    finally:
+        grab.stop()
 
 
 def test_the_recording_counter_updates_while_recording(window, qapp):
@@ -561,9 +922,9 @@ def test_grabs_are_released_when_the_window_closes(qapp, tmp_path):
 
     win = gui.MacroRecWindow(
         Settings(record_key="F9"), grab_factory=grab_factory,
-        recorder_factory=lambda: FakeRecorder([]),
+        recorder_factory=lambda capture_raw_input: FakeRecorder([]),
         player_factory=lambda skip: FakePlayer(),
-        warnings_factory=lambda macro, panic: [],
+        warnings_factory=lambda macro, panic, panic_key_is_withheld: [],
         settings_path=str(tmp_path / "settings.json"))
     win.show()
     qapp.processEvents()
@@ -724,6 +1085,47 @@ def test_window_shortcuts_are_listed_in_the_settings_dialog(qapp):
         "open_key", "save_key", "save_as_key", "reload_key"}
     assert dialog.window_edits["open_key"].text() == "Ctrl+O"
     assert dialog.window_edits["save_as_key"].text() == "Ctrl+Shift+S"
+
+
+def test_the_motion_path_checkbox_is_seeded_from_settings(qapp):
+    dialog = gui.SettingsDialog(Settings(), key_check=lambda spec: True)
+    assert dialog.motion_path_check.isChecked() is False
+
+    on = gui.SettingsDialog(Settings(capture_motion_path=True),
+                            key_check=lambda spec: True)
+    assert on.motion_path_check.isChecked() is True
+
+
+def test_the_motion_path_checkbox_is_written_back_on_accept(qapp):
+    settings = Settings()
+    dialog = gui.SettingsDialog(settings, key_check=lambda spec: True)
+    dialog.motion_path_check.setChecked(True)
+    dialog.accept()
+
+    assert dialog.result() == gui.QDialog.Accepted
+    assert settings.capture_motion_path is True
+
+
+def test_a_rejected_keybind_leaves_the_motion_path_setting_untouched(qapp, monkeypatch):
+    """It is assigned after every early return, like the keybinds it sits beside."""
+    monkeypatch.setattr(gui.QMessageBox, "warning",
+                        staticmethod(lambda *a, **k: None))
+    settings = Settings()
+    dialog = gui.SettingsDialog(settings, key_check=lambda spec: False)
+    dialog.motion_path_check.setChecked(True)
+    dialog.accept()
+
+    assert settings.capture_motion_path is False
+
+
+def test_the_motion_path_setting_persists_on_close(qapp, tmp_path):
+    path = str(tmp_path / "settings.json")
+    win = gui.MacroRecWindow(Settings(), settings_path=path)
+    win.settings.capture_motion_path = True
+    win.close()
+    qapp.processEvents()
+
+    assert Settings.load(path).capture_motion_path is True
 
 
 def test_window_shortcuts_come_from_settings_not_from_literals(window, qapp):
@@ -952,6 +1354,7 @@ def test_the_window_records_and_replays_through_the_real_x_backend(
         win.open_file(str(path))
         qapp.processEvents()
         assert win.macro.events == recorded
+        assert merge_sleeps(recorded) == recorded, "sleeps left merged on the way out"
 
         # Replay it, watching with an independent recorder.
         watcher = x11.X11Recorder(xvfb.name)
@@ -965,7 +1368,12 @@ def test_the_window_records_and_replays_through_the_real_x_backend(
             watcher.stop()
 
         from macrorec.collapse import collapse_motion
-        assert collapse_motion(seen) == recorded
+        # Sleeps filtered out on both sides: this asserts the events and their order,
+        # and `seen` is a raw capture that has none. The recording's own sleeps depend
+        # on how fast five XTEST injections happened to land, which is not a property
+        # worth pinning here.
+        assert ([e for e in collapse_motion(seen) if not isinstance(e, Sleep)]
+                == [e for e in recorded if not isinstance(e, Sleep)])
     finally:
         win.close()
         qapp.processEvents()

@@ -39,6 +39,7 @@ SAMPLES = {
     "keyup": "keyup ctrl",
     "type": 'type "hello"',
     "move": "move 10 20",
+    "moverel": "moverel -10 20",
     "click": "click left",
     "mousedown": "mousedown left",
     "mouseup": "mouseup left",

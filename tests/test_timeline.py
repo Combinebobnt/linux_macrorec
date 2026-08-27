@@ -1,7 +1,7 @@
 import pytest
 
 from macrorec.events import Click, KeyTap, Move, Sleep
-from macrorec.timeline import build_schedule, to_events
+from macrorec.timeline import MIN_SLEEP_MS, build_schedule, to_events
 
 
 def test_sleeps_become_offsets_and_disappear_from_the_steps():
@@ -66,9 +66,38 @@ def test_to_events_inserts_sleeps_between_timestamps():
     ]
 
 
-def test_to_events_drops_sub_threshold_gaps():
+def test_to_events_defers_a_sub_threshold_gap_rather_than_dropping_it():
+    """No `sleep 1` line, because one would be capture noise - but the millisecond is
+    folded into the next sleep, not lost. 0.5s of wall clock, 500ms of sleep."""
     timed = [(0.0, KeyTap("a")), (0.001, KeyTap("b")), (0.5, KeyTap("c"))]
-    assert to_events(timed) == [KeyTap("a"), KeyTap("b"), Sleep(499), KeyTap("c")]
+    assert to_events(timed) == [KeyTap("a"), KeyTap("b"), Sleep(500), KeyTap("c")]
+
+
+def test_sub_threshold_gaps_accumulate_into_the_next_sleep():
+    """The defect this replaced: raw XRecord motion arrives every 1-3ms, so every gap
+    fell under the floor, each was dropped on its own, and a whole fast stroke replayed
+    with no delay at all."""
+    timed = [(i * 0.002, KeyTap("a")) for i in range(301)]  # 300 gaps of 2ms = 0.600s
+
+    events = to_events(timed)
+    total = sum(e.ms for e in events if isinstance(e, Sleep))
+    assert total == pytest.approx(600, abs=MIN_SLEEP_MS)
+    assert build_schedule(events).duration == pytest.approx(0.6, abs=0.005)
+
+
+def test_no_drift_accumulates_over_mixed_gaps():
+    """The anchor advances by the amount emitted, never to the event's own timestamp,
+    so the sub-millisecond remainder is not shaved off once per sleep."""
+    timed = [(0.0, KeyTap("a"))]
+    at = 0.0
+    for index in range(50):
+        at += 0.0031 if index % 2 else 0.0234  # one over the floor, one under
+        timed.append((at, KeyTap("a")))
+
+    events = to_events(timed)
+    total = sum(e.ms for e in events if isinstance(e, Sleep))
+    # Error is bounded by the one residual left unemitted at the end, not by 50 of them.
+    assert total == pytest.approx(at * 1000, abs=MIN_SLEEP_MS)
 
 
 def test_to_events_and_build_schedule_are_inverses():

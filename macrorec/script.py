@@ -22,6 +22,7 @@ from .events import (
     MouseDown,
     MouseUp,
     Move,
+    MoveRel,
     Scroll,
     Sleep,
     TypeText,
@@ -35,7 +36,7 @@ SUPPORTED_VERSION = 1
 #: not listed here, and the README test iterates it, so adding a command without
 #: documenting it fails the suite.
 COMMANDS = (
-    "key", "keydown", "keyup", "type", "move",
+    "key", "keydown", "keyup", "type", "move", "moverel",
     "click", "mousedown", "mouseup", "scroll", "sleep",
 )
 
@@ -157,6 +158,15 @@ def _parse_command(word: str, rest: str, line_no: int) -> Event:
         except ValueError:
             raise ScriptError(line_no, f"'move' needs integer coordinates, got {rest!r}") from None
 
+    if word == "moverel":
+        parts = rest.split()
+        if len(parts) != 2:
+            raise ScriptError(line_no, "'moverel' takes a dx and a dy")
+        try:
+            return MoveRel(int(parts[0]), int(parts[1]))
+        except ValueError:
+            raise ScriptError(line_no, f"'moverel' needs integer deltas, got {rest!r}") from None
+
     if word in ("click", "mousedown", "mouseup"):
         button = normalise_button(rest) if rest else "left"
         if button not in BUTTONS:
@@ -245,6 +255,8 @@ def format_event(event: Event) -> str:
         return f'type "{_escape_string(event.text)}"'
     if isinstance(event, Move):
         return f"move {event.x} {event.y}"
+    if isinstance(event, MoveRel):
+        return f"moverel {event.dx} {event.dy}"
     if isinstance(event, Click):
         return f"click {event.button}"
     if isinstance(event, MouseDown):

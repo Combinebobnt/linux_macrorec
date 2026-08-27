@@ -10,11 +10,16 @@ def test_defaults_when_no_file_exists(tmp_path):
     assert settings.always_on_top is True
     assert settings.speed == 1.0
     assert settings.loops == 1
+    # Off by default: path capture makes files far longer, so it must be opted into.
+    assert settings.capture_motion_path is False
+    # Off by default: it replaces XRecord/XGrabKey with XI2 for the next recording.
+    assert settings.capture_raw_input is False
 
 
 def test_save_then_load_round_trip(tmp_path):
     path = str(tmp_path / "settings.json")
     original = Settings(panic_key="F12", always_on_top=False, speed=2.5, loops=0,
+                        capture_motion_path=True, capture_raw_input=True,
                         last_directory="/tmp/macros")
     original.save(path)
     assert Settings.load(path) == original

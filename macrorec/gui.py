@@ -35,7 +35,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from .collapse import collapse_motion
+from .collapse import accumulate_motion, collapse_motion, merge_sleeps, sample_motion
 from .events import MOUSE_EVENTS, KeyDown, KeyUp, Macro, Move, Sleep
 from .playback import Playback
 from .script import ScriptError, format_macro, parse
@@ -49,7 +49,10 @@ RECORDING = "recording"
 PLAYING = "playing"
 
 
-def _default_recorder():
+def _default_recorder(capture_raw_input):
+    if capture_raw_input:
+        from .backend.xi2 import XI2Recorder
+        return XI2Recorder()
     from .backend.x11 import X11Recorder
     return X11Recorder()
 
@@ -64,9 +67,15 @@ def _default_grab():
     return HotkeyGrab()
 
 
-def _default_warnings(macro, panic_sym):
+def _default_game_grab():
+    from .backend.xi2 import RawHotkeyWatch
+    return RawHotkeyWatch()
+
+
+def _default_warnings(macro, panic_sym, panic_key_is_withheld):
     from .backend.x11 import macro_warnings
-    return macro_warnings(macro, panic_sym=panic_sym)
+    return macro_warnings(
+        macro, panic_sym=panic_sym, panic_key_is_withheld=panic_key_is_withheld)
 
 
 def _default_key_check(spec):
@@ -170,6 +179,37 @@ class SettingsDialog(QDialog):
         window_box = QGroupBox("Window shortcuts (only when focused)")
         window_box.setLayout(window_form)
 
+        self.motion_path_check = QCheckBox("Capture mouse movement paths")
+        self.motion_path_check.setChecked(settings.capture_motion_path)
+        self.motion_path_check.setToolTip(
+            "Record the route the pointer takes, not just the position where each\n"
+            "click happens. Drags and freehand strokes then replay along the same\n"
+            "path at the same speed.\n\n"
+            "Off by default: it makes macro files far longer and harder to edit by\n"
+            "hand. Takes effect on the next recording.")
+
+        self.raw_input_check = QCheckBox("Capture raw input (for fullscreen games)")
+        self.raw_input_check.setChecked(settings.capture_raw_input)
+        self.raw_input_check.setToolTip(
+            "Record via XI2 raw input instead of the ordinary capture. Needed for\n"
+            "mouselook in a fullscreen game: it grabs the pointer and warps it back\n"
+            "to centre every frame, which hides the real motion from ordinary\n"
+            "recording entirely.\n\n"
+            "Also moves the panic stop to a passive XI2 watcher, since a game's own\n"
+            "exclusive keyboard grab blocks the ordinary one too - the panic key\n"
+            "will then also reach the game, opening its menu, rather than being\n"
+            "withheld from it. The watcher tells its own injected keys from real\n"
+            "ones, so a macro may now contain the panic key itself and it plays\n"
+            "back and types normally instead of being skipped with a warning.\n\n"
+            "Off by default. Takes effect on the next recording and the next play.")
+
+        recording_layout = QVBoxLayout()
+        recording_layout.addWidget(self.motion_path_check)
+        recording_layout.addWidget(self.raw_input_check)
+
+        recording_box = QGroupBox("Recording")
+        recording_box.setLayout(recording_layout)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
         buttons.accepted.connect(self.accept)
@@ -178,6 +218,7 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(globals_box)
         layout.addWidget(window_box)
+        layout.addWidget(recording_box)
         layout.addWidget(buttons)
 
     def accept(self) -> None:
@@ -253,6 +294,10 @@ class SettingsDialog(QDialog):
         self.settings.play_key = cleaned["Play"]
         for field, spec in window_keys.items():
             setattr(self.settings, field, spec)
+        # Nothing to validate on a checkbox, so it is assigned with the rest, after
+        # every early return that leaves settings untouched.
+        self.settings.capture_motion_path = self.motion_path_check.isChecked()
+        self.settings.capture_raw_input = self.raw_input_check.isChecked()
         super().accept()
 
 
@@ -261,6 +306,7 @@ class MacroRecWindow(QMainWindow):
                  recorder_factory=_default_recorder,
                  player_factory=_default_player,
                  grab_factory=_default_grab,
+                 game_grab_factory=_default_game_grab,
                  warnings_factory=_default_warnings,
                  panic_skip=_default_panic_skip,
                  hotkey_syms=_default_hotkey_syms,
@@ -272,6 +318,7 @@ class MacroRecWindow(QMainWindow):
         self._recorder_factory = recorder_factory
         self._player_factory = player_factory
         self._grab_factory = grab_factory
+        self._game_grab_factory = game_grab_factory
         self._warnings_factory = warnings_factory
         self._panic_skip = panic_skip
         self._hotkey_syms_for = hotkey_syms
@@ -475,6 +522,15 @@ class MacroRecWindow(QMainWindow):
             bindings[self.settings.play_key] = "play"
         return bindings
 
+    def _use_game_grab(self) -> bool:
+        """During playback, a game may hold an exclusive keyboard grab that
+        `HotkeyGrab`'s `XGrabKey` would never see past - the same reason
+        `capture_raw_input` swaps the recorder for `XI2Recorder`. Gated on the
+        setting rather than used unconditionally: `RawHotkeyWatch` is a passive
+        watch, not a grab, so the panic key would also reach whatever window is
+        focused, which is only an acceptable trade while chasing a game."""
+        return self.mode == PLAYING and self.settings.capture_raw_input
+
     def _rebind_hotkeys(self) -> None:
         if self._grab is not None:
             self._grab.stop()
@@ -484,8 +540,9 @@ class MacroRecWindow(QMainWindow):
         self._hotkey_syms = bindings
         if not bindings:
             return
+        factory = self._game_grab_factory if self._use_game_grab() else self._grab_factory
         try:
-            grab = self._grab_factory()
+            grab = factory()
             grab.start({
                 sym: (lambda action=action: self.bridge.hotkey.emit(action))
                 for sym, action in bindings.items()
@@ -539,7 +596,7 @@ class MacroRecWindow(QMainWindow):
             return
         self._captured = []
         try:
-            self._recorder = self._recorder_factory()
+            self._recorder = self._recorder_factory(self.settings.capture_raw_input)
             self._recorder.start(self._on_captured)
         except Exception as exc:
             self._recorder = None
@@ -564,13 +621,33 @@ class MacroRecWindow(QMainWindow):
         if recorder is not None:
             recorder.stop()
         captured = list(self._captured)
-        events = collapse_motion(to_events(captured))
+        # Read the preference here, not at construction, so toggling it applies to
+        # the next recording rather than the next launch. Sampling/accumulating run
+        # before to_events; collapsing runs after. See collapse.sample_motion for
+        # why. capture_raw_input takes priority: XI2Recorder emits MoveRel, which
+        # collapse_motion cannot touch (collapsing deltas to their last one is
+        # meaningless) and sample_motion cannot either (it keeps the last sample
+        # rather than summing, which would throw away most of a fast turn).
+        if self.settings.capture_raw_input:
+            events = to_events(accumulate_motion(captured))
+        elif self.settings.capture_motion_path:
+            events = to_events(sample_motion(captured))
+        else:
+            events = collapse_motion(to_events(captured))
         by_click, self._stopped_by_click = self._stopped_by_click, False
         by_hotkey, self._stopped_by_hotkey = self._stopped_by_hotkey, None
         if by_click:
+            # In game mode there is no absolute Move at all, only MoveRel, so
+            # _trim_own_interaction's window-geometry scan always no-ops here: a
+            # stated restriction (AGENTS.md), not a silent gap. Recording is
+            # stopped with a hotkey in a fullscreen game anyway, where this path
+            # is unreachable.
             events = self._trim_own_interaction(events)
         elif by_hotkey:
             events = self._trim_trailing_key(events, by_hotkey)
+        # Last, so it normalises whatever the trims left behind. Order against them is
+        # immaterial either way: both pop a whole run of trailing sleeps, not one.
+        events = merge_sleeps(events)
         self.macro = Macro(events=events)
         self._set_layout_header()
 
@@ -606,6 +683,12 @@ class MacroRecWindow(QMainWindow):
         XRecord taps every client's events, so pressing Stop is captured like any
         other click and every macro would otherwise end by clicking wherever this
         window happened to be.
+
+        With motion-path capture on there is a whole run of moves walking the pointer
+        here, not one, so the run goes too. The walk stops at the first move outside
+        our rect, and at any event that is not a move or a sleep, which keeps it to
+        the approach contiguous with the click that ended the recording: an earlier
+        click inside our rect that the macro genuinely wanted is left alone.
         """
         rect = self.frameGeometry()
         last_move = None
@@ -621,7 +704,17 @@ class MacroRecWindow(QMainWindow):
         if not any(isinstance(e, MOUSE_EVENTS) for e in events[last_move + 1:]):
             return events
 
-        trimmed = events[:last_move]
+        start = last_move
+        for index in range(last_move - 1, -1, -1):
+            event = events[index]
+            if isinstance(event, Sleep):
+                continue
+            if isinstance(event, Move) and rect.contains(event.x, event.y):
+                start = index
+                continue
+            break
+
+        trimmed = events[:start]
         while trimmed and isinstance(trimmed[-1], Sleep):
             trimmed.pop()
         return trimmed
@@ -650,11 +743,17 @@ class MacroRecWindow(QMainWindow):
             QMessageBox.warning(self, "macrorec", "\n\n".join(warnings))
 
         # Only an unmodified panic key is withheld from playback: a macro's plain
-        # Escape cannot trigger a Ctrl+Escape panic stop.
-        try:
-            skip = self._panic_skip(self.settings.panic_key)
-        except Exception:
+        # Escape cannot trigger a Ctrl+Escape panic stop. With capture_raw_input
+        # on, nothing is withheld at all: RawHotkeyWatch filters its own injected
+        # keys by sourceid instead, so the panic key can be typed without
+        # stopping the macro that types it - see AGENTS.md.
+        if self.settings.capture_raw_input:
             skip = None
+        else:
+            try:
+                skip = self._panic_skip(self.settings.panic_key)
+            except Exception:
+                skip = None
         try:
             self._player = self._player_factory({skip} if skip else set())
         except Exception as exc:
@@ -678,7 +777,9 @@ class MacroRecWindow(QMainWindow):
 
     def _collect_warnings(self) -> list[str]:
         try:
-            return list(self._warnings_factory(self.macro, self.settings.panic_key))
+            return list(self._warnings_factory(
+                self.macro, self.settings.panic_key,
+                not self.settings.capture_raw_input))
         except Exception:
             return []
 

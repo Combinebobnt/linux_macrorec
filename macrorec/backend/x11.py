@@ -34,9 +34,9 @@ from .base import EventSink, Player, Recorder
 XK.load_keysym_group("xkb")
 
 #: X button numbers 4-7 are wheel detents, not buttons anyone can press.
-_SCROLL_BUTTONS = {4: "up", 5: "down", 6: "left", 7: "right"}
+SCROLL_BUTTONS = {4: "up", 5: "down", 6: "left", 7: "right"}
 _BUTTON_NUMBERS = {"left": 1, "middle": 2, "right": 3}
-_SCROLL_NUMBERS = {name: number for number, name in _SCROLL_BUTTONS.items()}
+_SCROLL_NUMBERS = {name: number for number, name in SCROLL_BUTTONS.items()}
 
 #: Keys that hold rather than type. Auto-shifting must not fight a macro that
 #: holds one of these explicitly.
@@ -193,6 +193,14 @@ class X11Player(Player):
         xtest.fake_input(self.display, X.MotionNotify, x=x, y=y)
         self.display.sync()
 
+    def move_rel(self, dx: int, dy: int) -> None:
+        """`detail=1` is what makes this relative; `move()` above omits it and is
+        absolute. Measured against Xvfb: asked (+25, -10), XTEST delivered exactly
+        (+25, -10) - no evdev/uinput needed, see `backend/xi2.py`'s module
+        docstring for the fuller measurement."""
+        xtest.fake_input(self.display, X.MotionNotify, detail=1, x=dx, y=dy)
+        self.display.sync()
+
     def button_down(self, button: str) -> None:
         xtest.fake_input(self.display, X.ButtonPress, _BUTTON_NUMBERS[button])
         self.display.sync()
@@ -307,26 +315,20 @@ class X11Recorder(Recorder):
 
     def _translate(self, raw) -> Event | None:
         if raw.type == X.KeyPress:
-            return KeyDown(self._sym_for(raw.detail))
+            return KeyDown(keycode_to_sym(self._record_display, raw.detail))
         if raw.type == X.KeyRelease:
-            return KeyUp(self._sym_for(raw.detail))
+            return KeyUp(keycode_to_sym(self._record_display, raw.detail))
         if raw.type == X.MotionNotify:
             return Move(raw.root_x, raw.root_y)
         if raw.type == X.ButtonPress:
-            if raw.detail in _SCROLL_BUTTONS:
-                return Scroll(_SCROLL_BUTTONS[raw.detail], 1)
-            return MouseDown(_button_name(raw.detail))
+            if raw.detail in SCROLL_BUTTONS:
+                return Scroll(SCROLL_BUTTONS[raw.detail], 1)
+            return MouseDown(button_name(raw.detail))
         if raw.type == X.ButtonRelease:
-            if raw.detail in _SCROLL_BUTTONS:
+            if raw.detail in SCROLL_BUTTONS:
                 return None  # the press already stood for the whole detent
-            return MouseUp(_button_name(raw.detail))
+            return MouseUp(button_name(raw.detail))
         return None
-
-    def _sym_for(self, keycode: int) -> str:
-        """Always the level-0 keysym. Any Shift the user held is captured as its own
-        event, so replaying base keysyms plus those modifier events reproduces what
-        was typed, and the file stays readable as `key a` rather than `key A`."""
-        return keysym_name(self._record_display.keycode_to_keysym(keycode, 0))
 
     def stop(self) -> None:
         if not self._recording:
@@ -357,7 +359,20 @@ class X11Recorder(Recorder):
         return self._recording
 
 
-def _button_name(number: int) -> str:
+def keycode_to_sym(dpy, keycode: int) -> str:
+    """Always the level-0 keysym. Any Shift the user held is captured as its own
+    event, so replaying base keysyms plus those modifier events reproduces what
+    was typed, and the file stays readable as `key a` rather than `key A`.
+
+    Module-level rather than a method: `backend/xi2.py`'s `XI2Recorder` needs the
+    same keycode-to-keysym translation for raw key events, which carry the same
+    keycode numbers core events do. AGENTS.md records the fake-diverging-from-real
+    trap a second copy of this would be.
+    """
+    return keysym_name(dpy.keycode_to_keysym(keycode, 0))
+
+
+def button_name(number: int) -> str:
     for name, value in _BUTTON_NUMBERS.items():
         if value == number:
             return name
@@ -613,11 +628,16 @@ def panic_skip_sym(panic_hotkey: str) -> str | None:
     return sym if mask == 0 else None
 
 
-def macro_warnings(macro, dpy=None, panic_sym: str = "Escape") -> list[str]:
+def macro_warnings(macro, dpy=None, panic_sym: str = "Escape",
+                    panic_key_is_withheld: bool = True) -> list[str]:
     """Everything worth telling the user at load time, before anything is injected.
 
     Warn-and-skip rather than refuse: a macro containing the panic key still plays,
-    minus those keystrokes.
+    minus those keystrokes. `panic_key_is_withheld=False` turns that off - the
+    panic sym is checked and typed like any other key, and there is nothing to
+    warn about - for `capture_raw_input` mode, where `RawHotkeyWatch` filters its
+    own injected keys by `sourceid` instead (see `backend/xi2.py`), so the panic
+    key can be typed without stopping the macro that types it.
     """
     warnings = []
     owns = dpy is None
@@ -630,7 +650,7 @@ def macro_warnings(macro, dpy=None, panic_sym: str = "Escape") -> list[str]:
                 f"macro was recorded on layout {macro.layout!r} but this keyboard "
                 f"is {layout!r}; keys may not match")
 
-        skip = panic_skip_sym(panic_sym)
+        skip = panic_skip_sym(panic_sym) if panic_key_is_withheld else None
         panic_seen = False
         unresolved = []
         for sym in _macro_key_syms(macro):

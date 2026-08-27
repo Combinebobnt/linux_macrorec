@@ -2,6 +2,7 @@
 # not how it got built.
 docs/TODO.md
 docs/PLAN.md
+docs/PLAN_*.md
 
 # Python
 __pycache__/

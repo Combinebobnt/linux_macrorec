@@ -15,7 +15,9 @@ from dataclasses import dataclass
 
 from .events import Event, Sleep
 
-#: Gaps below this are noise from the capture path, not intent.
+#: A gap below this gets no `sleep` line of its own, because one would be noise from
+#: the capture path rather than intent. It is still carried forward and folded into the
+#: next line, never dropped: see `to_events`.
 MIN_SLEEP_MS = 5
 
 
@@ -68,14 +70,27 @@ def build_schedule(events, speed: float = 1.0) -> Schedule:
 
 def to_events(timed, min_ms: int = MIN_SLEEP_MS) -> list[Event]:
     """The inverse: turn recorded `(seconds, event)` pairs into an event list with
-    `Sleep` deltas between them, which is what gets written to a file."""
+    `Sleep` deltas between them, which is what gets written to a file.
+
+    A gap under `min_ms` is **deferred, not discarded**: the anchor stays put, so the
+    remainder is folded into the next `Sleep` that does clear the floor. Advancing the
+    anchor per event instead is what used to lose a whole fast mouse stroke - raw
+    XRecord motion arrives every 1-3ms, so 300 samples over 600ms were 300 separately
+    dropped gaps and the macro replayed with no delay at all.
+
+    The anchor advances by the amount actually emitted, never to `at`, so the
+    sub-millisecond fraction is not thrown away once per `Sleep` and the accumulated
+    error stays at zero rather than random-walking across a long macro.
+    """
     out: list[Event] = []
-    previous = None
+    anchor = None
     for at, event in timed:
-        if previous is not None:
-            gap = round((at - previous) * 1000)
+        if anchor is None:
+            anchor = at
+        else:
+            gap = round((at - anchor) * 1000)
             if gap >= min_ms:
                 out.append(Sleep(gap))
+                anchor += gap / 1000.0
         out.append(event)
-        previous = at
     return out

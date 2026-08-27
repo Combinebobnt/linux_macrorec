@@ -101,11 +101,18 @@ never fire.
 One consequence worth knowing: a macro containing the panic key has those keystrokes skipped during
 playback, since otherwise it would stop itself. That only applies when the panic key has no
 modifiers. With `Ctrl+Escape` as the panic stop, a macro's plain `Escape` cannot trigger it, so it
-is typed normally.
+is typed normally. This does not apply with **Capture raw input** on, the Settings checkbox for
+recording mouselook in a fullscreen game: its panic stop tells its own keystrokes from real ones,
+so nothing is skipped and there is nothing to warn about.
 
 Recording captures keystrokes, clicks, scrolling, and the pointer position where each click
 happens. Pointer movement between clicks is not recorded, which is what keeps the files short and
 editable.
+
+If you need the route the pointer took rather than just where it stopped, turn on **Capture mouse
+movement paths** under Recording in the settings dialog. Drags and freehand strokes then replay
+along the same path at the same speed. It is off by default, because it makes macro files far
+longer and harder to edit by hand, and it applies to the next recording you start.
 
 ## Macro file format
 
@@ -136,6 +143,7 @@ inside a quoted string.
 | `keydown <name>` / `keyup <name>` | Hold a key down, release it later |
 | `type "<text>"` | Type a string. Expands to individual keystrokes at replay time |
 | `move <x> <y>` | Move the pointer to an absolute screen position |
+| `moverel <dx> <dy>` | Move the pointer by a relative offset, signed integers |
 | `click <left\|middle\|right>` | Press and release a button |
 | `mousedown <button>` / `mouseup <button>` | Hold a button, for dragging |
 | `scroll <up\|down\|left\|right> [count]` | Scroll, `count` detents (default 1) |
@@ -164,14 +172,24 @@ writing `key A` or `type "Hi"` by hand does the right thing.
   only the gaps the recorder left.
 - **Timing does not drift.** Delays are converted to offsets from a single start instant, so a
   macro looped a hundred times ends on schedule rather than a hundred roundings late.
+- **Mouse motion is recorded as endpoints, not as a path**, so a few seconds of mousing becomes one
+  `move` line instead of thousands. The time it took is kept: you get the travel as a `sleep` before
+  the move and any pause on the target as a `sleep` after it. Turn on **Capture motion path** in
+  Settings when the route itself matters, for freehand drawing or a drag that has to follow a
+  particular line.
 - **Record and Play are mutually exclusive.** Recording during playback would capture macrorec's
   own injected input.
 - **A macro that contains the panic key still plays**, with those keystrokes skipped and a warning
-  when it loads. Otherwise it would stop itself.
+  when it loads. Otherwise it would stop itself. With **Capture raw input** on, neither the skip nor
+  the warning applies: the panic watch tells its own keystrokes from real ones and the panic key
+  types normally.
 - **The click on Stop that ends a recording is not recorded.** Only that final click, and only when
   the mouse is what stopped the recording. An earlier click on the macrorec window during a
   recording is kept, on the grounds that it might have been deliberate.
 - Preferences live in `$XDG_CONFIG_HOME/macrorec/settings.json`, or `~/.config/macrorec/`.
+- **`moverel <dx> <dy>` replays a relative pointer move**, the form **Capture raw input** records
+  instead of absolute positions, since a fullscreen game's own pointer grab and warp-to-centre hide
+  the real motion from ordinary recording.
 
 ## Why X11 only
 
@@ -218,7 +236,7 @@ macrorec/
   events.py     event types, the shared vocabulary
   script.py     the DSL parser and formatter
   timeline.py   sleep deltas to an absolute schedule, speed scaling
-  collapse.py   pointer-motion reduction at record time
+  collapse.py   pointer-motion reduction at record time, endpoints or sampled path
   playback.py   runs a schedule against a player, on a worker thread
   settings.py   JSON preferences
   backend/

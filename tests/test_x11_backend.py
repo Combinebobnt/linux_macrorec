@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from macrorec.collapse import collapse_motion
+from macrorec.collapse import collapse_motion, sample_motion
 from macrorec.events import (
     Click,
     KeyDown,
@@ -157,6 +157,25 @@ def test_pointer_and_buttons_are_observed(xvfb, capture):
     assert [e for e in observed if not isinstance(e, Move)] == [
         MouseDown("left"), MouseUp("left"), MouseDown("right"), MouseUp("right"),
     ]
+
+
+def test_move_rel_injects_a_relative_displacement(xvfb):
+    """Measured against Xvfb: `detail=1` makes XTEST motion relative rather than
+    absolute, which is what lets replay work with no evdev/uinput at all - see
+    `backend/xi2.py`'s module docstring for the fuller probe this is built from."""
+    probe = x11.display.Display(xvfb.name)
+    player = x11.X11Player()
+    try:
+        probe.screen().root.warp_pointer(400, 300)
+        probe.sync()
+
+        player.move_rel(37, -19)
+
+        final = probe.screen().root.query_pointer()
+        assert (final.root_x, final.root_y) == (437, 281)
+    finally:
+        player.close()
+        probe.close()
 
 
 def test_scroll_records_as_one_event_per_detent(xvfb, capture):
@@ -725,3 +744,39 @@ def test_record_export_reimport_replay_round_trip(xvfb):
     first = [event for _, event in captured]
     second = [event for _, event in replayed]
     assert collapse_motion(second) == collapse_motion(first)
+
+
+def test_a_sampled_path_survives_real_capture_timestamps(xvfb):
+    """Every other sample_motion test feeds it tidy hand-written floats. Real
+    timestamps are `monotonic() - origin` with jitter, and a fake being kinder than
+    the backend it stands in for has caused three bugs in this project already."""
+    recorder = x11.X11Recorder(xvfb.name)
+    captured = []
+    recorder.start(lambda at, event: captured.append((at, event)))
+
+    player = x11.X11Player()
+    for x in range(10):
+        player.perform(Move(100 + x * 10, 200 + x * 5))
+        time.sleep(0.02)  # comfortably over the 16ms sample interval
+    player.perform(Click("left"))
+    player.close()
+
+    settle(captured, 11)
+    recorder.stop()
+
+    macro = Macro(
+        events=to_events(sample_motion(captured)),
+        name="path",
+        layout=None,
+    )
+    reloaded = parse(format_macro(macro))
+    assert reloaded == macro, "a path macro did not survive a write/read cycle"
+
+    moves = [e for e in reloaded.events if isinstance(e, Move)]
+    assert len(moves) > 2, "the path was kept, not collapsed to an endpoint"
+    assert moves[-1] == Move(190, 245), "the click position stayed exact"
+
+    offsets = [step.at for step in build_schedule(reloaded.events)]
+    assert offsets == sorted(offsets)
+    assert len(set(offsets)) > 2, "real timestamps still produce a spread schedule"
+    assert offsets[-1] > 0.1, "the stroke keeps its real duration"

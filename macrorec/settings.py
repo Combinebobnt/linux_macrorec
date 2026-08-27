@@ -24,6 +24,14 @@ DEFAULTS = {
     "save_as_key": "Ctrl+Shift+S",
     "reload_key": "Ctrl+R",
     "always_on_top": True,
+    # Off by default: keeping the path turns a few seconds of mousing into hundreds
+    # of lines, and a short hand-editable file is what most macros want.
+    "capture_motion_path": False,
+    # Off by default: replaces XRecord with XI2 raw input entirely for the next
+    # recording, for mouselook in a fullscreen game that grabs the pointer. Also
+    # moves the panic stop to a passive XI2 watcher instead of XGrabKey, since a
+    # game's exclusive keyboard grab would otherwise block the ordinary grab too.
+    "capture_raw_input": False,
     "speed": 1.0,
     "loops": 1,
     "last_directory": "",
@@ -49,6 +57,8 @@ class Settings:
     save_as_key: str = DEFAULTS["save_as_key"]
     reload_key: str = DEFAULTS["reload_key"]
     always_on_top: bool = DEFAULTS["always_on_top"]
+    capture_motion_path: bool = DEFAULTS["capture_motion_path"]
+    capture_raw_input: bool = DEFAULTS["capture_raw_input"]
     speed: float = DEFAULTS["speed"]
     loops: int = DEFAULTS["loops"]
     last_directory: str = DEFAULTS["last_directory"]

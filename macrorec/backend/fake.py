@@ -42,6 +42,9 @@ class FakePlayer(Player):
     def move(self, x: int, y: int) -> None:
         self.calls.append(("move", x, y))
 
+    def move_rel(self, dx: int, dy: int) -> None:
+        self.calls.append(("move_rel", dx, dy))
+
     def button_down(self, button: str) -> None:
         self.calls.append(("button_down", button))
 

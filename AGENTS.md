@@ -73,11 +73,15 @@ macrorec/
                 the char-to-keysym-name map that `type` expands through
   script.py     the DSL parser and formatter. Pure, no X
   timeline.py   sleep deltas <-> absolute schedule, speed scaling
-  collapse.py   motion-to-endpoints reduction at record time
+  collapse.py   motion reduction at record time: endpoints by default,
+                interval-sampled path capture when the setting is on
   backend/
     base.py     abstract Recorder/Player. `Player.perform()` dispatches an event to
-                six primitives, so a backend only implements those six
+                seven primitives, so a backend only implements those seven
     x11.py      XRecord capture, XTEST injection, global hotkey grabs
+    xi2.py      XI2Recorder (capture) and RawHotkeyWatch (the game-mode panic
+                stop). Both see through a pointer/keyboard grab and a warp,
+                which core XRecord/XGrabKey cannot - see the module docstring
     fake.py     in-memory backend for headless logic tests
   playback.py   runs a Schedule against a Player on a worker thread
   settings.py   JSON preferences under $XDG_CONFIG_HOME/macrorec/
@@ -112,10 +116,50 @@ a machine with `input` group membership, without the parser, timeline or GUI kno
 - **The recorder reports level-0 keysyms.** It writes `key a`, never `key A`; a held Shift is
   captured as its own event. Base keysyms plus modifier events reproduce what was typed, and the
   file stays readable.
-- **Motion collapses to endpoints.** A run of pointer moves reduces to its last one, kept only if a
-  mouse action follows. This is what keeps files editable; freehand path capture is not a goal.
-  `Sleep` is transparent to the reduction, so dropping motion never changes when the next real
-  action happens.
+- **Motion collapses to endpoints by default.** A run of pointer moves reduces to its last one,
+  kept only if a mouse action follows. This is what keeps files editable. No `Sleep` is ever dropped
+  by the reduction, so collapsing motion never changes when the next real action happens. That was
+  only ever half the story, though, and the other half shipped broken: the sleeps have to *exist*
+  first, and for fast mousing they did not - see the `to_events` bullet below.
+- **A collapsed run's time is split around the surviving move: travel before it, dwell after.**
+  Both halves are real - a user drags the pointer over, pauses, then clicks - and either extreme is a
+  bug. All of it after the move hovers the target for the whole approach, firing tooltips and hover
+  menus the recording never triggered. All of it before gives the target no hover at all and takes a
+  drag's settle time away from the application, which needs a moment to process the motion before the
+  button comes up. Splitting reproduces the original timing rather than redistributing it.
+- **`merge_sleeps` runs last, over whatever the mode branch and the trims produced.** Recovering a
+  fast stroke's time turns it into a long run of `sleep 5` lines, and one `sleep 594` says the same
+  thing in a file whose whole point is being hand-editable. Order against the trims is immaterial:
+  both pop a whole run of trailing sleeps, not one. It must not move into `script.parse`, though -
+  two consecutive `sleep` lines in a hand-written file have to round-trip.
+- **Path capture is the opt-in alternative, and it samples before `to_events`, not after.** The
+  `capture_motion_path` setting swaps `collapse_motion` for `collapse.sample_motion`, which thins
+  motion to one sample per `MOTION_SAMPLE_SECONDS` (16ms) and keeps the route. The ordering is the
+  whole trick: `build_schedule` advances its clock only on a `Sleep`, so thinning *after* `to_events`
+  throws away the sleeps standing between the moves it drops, and the stroke replays faster than it
+  was made. The sample interval and `MIN_SLEEP_MS` are one knob seen twice; a test asserts 16 > 5 so
+  nobody lowers the interval into the floor. Since sub-floor gaps are now deferred rather than
+  discarded, the interval no longer decides whether a path keeps its *total* duration, only how
+  finely that duration is written down - but the ordering rule stands unchanged.
+- **`to_events` defers a sub-`MIN_SLEEP_MS` gap, it does not discard it.** The anchor stays put until
+  a gap clears the floor, so the remainder folds into the next `Sleep`. Advancing it per event is
+  what lost a whole fast mouse stroke in the default mode: raw XRecord motion arrives every 1-3ms, so
+  a 0.6s drag was 300 separately-dropped gaps, zero sleeps, and a 0.000s schedule with everything
+  after it firing early. Path capture never had it, because 16ms samples clear the floor - which is
+  exactly why it stayed hidden until path capture was built. The anchor advances **by the amount
+  emitted, never to the event's own timestamp**: resetting to `at` shaves the sub-millisecond
+  fraction off once per sleep and that error random-walks across a long macro. Fixed 2026-08-23.
+  **Measured against real hardware on `:0`, not just Xvfb:** a 4.9s freehand stroke delivered 2036
+  motion samples at a median gap of **1.89ms**, with **1851 of 2035 gaps under the 5ms floor**. The
+  schedule came out 3ms off the wall clock; before the fix it would have lost about 3.7s of 4.9s.
+  Any test that spaces its motion above 5ms proves nothing about this - which is exactly how the
+  defect survived a green suite for months.
+- **A held-back sample is flushed before any non-move event.** Otherwise a click lands at a position
+  up to one interval stale, which is the exact bug endpoint-collapse never had. The flush usually
+  falls within `MIN_SLEEP_MS` of the previous sample, so both moves share a schedule offset. That is
+  intended, not a rounding bug: a same-instant correction of a pixel or two buys an exact click. The
+  gap is carried into the following sleep rather than lost, but it still gets no line of its own, so
+  the shared offset is unchanged.
 - **The player never sleeps for a delta.** It waits until `monotonic_base + step.at`, so a long loop
   does not accumulate drift. `Player.perform()` rejects `Sleep` outright to keep that honest.
 - **The speed scalar divides every delay,** explicit `sleep` lines included. It scales the whole
@@ -179,14 +223,23 @@ a machine with `input` group membership, without the parser, timeline or GUI kno
   in whatever editor the user already has; Reload closes that loop. Record replaces the current
   macro with no prompt.
 - **The GUI's backends are injectable.** `MacroRecWindow` takes `recorder_factory`,
-  `player_factory`, `grab_factory` and `warnings_factory`, so the state machine is testable against
-  fakes with no X server at all. `gui.py` imports Xlib inside functions, never at module scope.
+  `player_factory`, `grab_factory`, `game_grab_factory` and `warnings_factory`, so the state
+  machine is testable against fakes with no X server at all. `gui.py` imports Xlib inside
+  functions, never at module scope.
 - **Worker-thread callbacks reach the GUI through Qt signals** (`gui._Bridge`). Touching a widget
   from the playback or panic-grab thread is undefined behaviour.
 - **The click that stops a recording is trimmed out of it.** XRecord taps every client, so pressing
   Stop is captured like any other click; left in, every macro would end by clicking wherever this
   window happened to be. Only a trailing interaction inside the window's own geometry, and only
-  when the mouse was what stopped the recording, is treated as ours.
+  when the mouse was what stopped the recording, is treated as ours. With path capture on it is a
+  whole run of moves walking here, not one, so the run goes too; the walk back stops at the first
+  move outside our rect and at any event that is not a move or a sleep, which keeps it to the
+  approach contiguous with that click. A macro that genuinely clicks over this window earlier on
+  keeps that click and the path leading to it. **A stated restriction, not a silent gap: with
+  `capture_raw_input` on, this scan always no-ops**, because game-mode recording emits `MoveRel`
+  only - there is no absolute `Move` to find our window rect against. Recording is stopped with a
+  hotkey in a fullscreen game anyway, where a click on our own Stop button is unreachable, so this
+  is left as-is rather than built out.
 - **`bootstrap.py` is stdlib-only and must stay that way.** It runs before python-xlib and PyQt5
   exist, so importing anything from `macrorec/` or a third-party package breaks the first launch,
   which is the launch where nothing else can help the user. A test enforces it.
@@ -195,3 +248,57 @@ a machine with `input` group membership, without the parser, timeline or GUI kno
   are visible to it, native Wayland windows are not.
 - **`LAUNCH_macrorec_LinuxMac.sh` must stay executable** (`100755`, matching the sibling projects).
   A test checks the bit, since git records it and a lost bit silently breaks double-click launching.
+- **`Player` has a seventh primitive, `move_rel`.** `X11Player.move_rel` is XTEST with `detail=1`,
+  which is what makes it relative rather than absolute like plain `move()` - measured against
+  Xvfb: asked `(+25, -10)`, got exactly that, no evdev/uinput needed. A macro's `moverel` line only
+  ever comes from a `capture_raw_input` recording, but replay does not care how a `MoveRel` was
+  produced.
+- **`capture_raw_input` swaps the recorder for `XI2Recorder` outright, not alongside `X11Recorder`.**
+  Its `_finish_recording` branch also swaps `collapse_motion` for `accumulate_motion`, run before
+  `to_events` like `sample_motion`: `collapse_motion` cannot touch `MoveRel` at all (collapsing
+  deltas to their last one is meaningless) and `sample_motion` would keep-last instead of summing,
+  silently discarding most of a fast turn.
+- **The panic stop moves to `RawHotkeyWatch` only while `capture_raw_input` is on and only during
+  playback**, never unconditionally. `HotkeyGrab`'s `XGrabKey` cannot survive a game's own
+  exclusive keyboard grab, which is the whole reason this exists, but the swap is not free: XI2
+  selection is passive observation, not a grab, so the panic key is no longer withheld from
+  whatever window is focused - an `Escape` panic stop also opens the game's own menu. Tolerable
+  because playback is already being aborted, and scoped to the one setting/mode where the
+  trade is worth it; every other panic stop keeps `HotkeyGrab`'s exclusive behaviour unchanged.
+  Record and Play hotkeys never move to XI2: they are pressed before a game has grabbed anything.
+- **`RawHotkeyWatch` reconstructs a modifier chord from raw keycodes by hand**, since the raw
+  payload carries no modifier field the way core events' `state` does (proven feasible, not built,
+  by the M0 spike). It seeds held modifiers from `query_keymap()` at `start()` rather than assuming
+  none are down - a Ctrl already held before playback begins must count from the first event, not
+  only from a press the watcher happens to see afterwards. It tracks only the keycodes
+  `MODIFIER_SYMS_BY_BIT` names, the same set `HotkeyGrab`'s `LOCK_MASKS` dance excludes CapsLock and
+  NumLock from, so lock state never decides a match here either.
+- **`RawHotkeyWatch` ignores its own XTEST-injected keys, by `sourceid`, and warn-and-skip drops
+  away with `capture_raw_input` on because of it.** A macro genuinely containing the exact modified
+  panic chord as ordinary content used to self-trigger the panic stop - measured, not assumed, in
+  what is now `test_raw_hotkey_watch_does_not_self_trigger_on_a_replayed_panic_chord`'s inverse.
+  `xtest_device_ids()` identifies the XTEST slave devices (by their `XTEST Device` property,
+  falling back to a name match) and `RawHotkeyWatch` drops any raw event whose `sourceid` names one
+  of them, before that event can enter held-modifier state or fire an action. Measured 2026-08-23:
+  even the master-attributed echo of an ungrabbed XTEST injection carries the *slave's* `sourceid`,
+  not the master's own, so the filter is correct ungrabbed as well as grabbed - see `xi2.py`'s
+  module docstring for the numbers. **Confirmed on real hardware, not just Xvfb, 2026-08-26**: a
+  live keypress still triggers the panic stop, and a macro replaying the same chord as ordinary
+  content plays it back instead of self-triggering - checked with the panic hotkey rebound rather
+  than at its Escape default, since the filter keys on device origin, not on which key was pressed,
+  so any configured chord exercises the identical path. `HotkeyGrab`'s `XGrabKey` path gets none of this: core events
+  carry nothing that distinguishes XTEST from a real key, so `panic_skip_sym`/warn-and-skip stay
+  exactly as they were with `capture_raw_input` off. `macro_warnings(...,
+  panic_key_is_withheld=False)` is what turns the warning off in the other mode, and
+  `gui.start_playback` picks `skip=None` there instead of calling `panic_skip_sym`.
+- **The filter fails closed, not open.** Discovering no XTEST devices, or `xtest_device_ids()`
+  raising, makes `RawHotkeyWatch.start()` raise rather than arm unfiltered - an unfiltered watch
+  would, once warn-and-skip is gone, let a replayed panic key stop the macro that legitimately
+  contains it, which is worse than no panic stop at all. `gui._rebind_hotkeys()` already catches a
+  `start()` failure and reports it, so the outcome is "no panic stop this run", not a silent,
+  unfiltered watch. An *explicit* `injected_ids` (including `frozenset()`, what
+  `tests/test_xi2_backend.py`'s `_hardware_watch` passes to stand in for real hardware, since Xvfb
+  cannot produce a non-XTEST keypress) is used verbatim and skips discovery entirely.
+- **`XI2Recorder` is deliberately not filtered.** Record and Play are mutually exclusive, so there
+  is no self-capture to prevent, and every recorder test's stimulus *is* XTEST - filtering there
+  would remove the only way to test the recorder headlessly.

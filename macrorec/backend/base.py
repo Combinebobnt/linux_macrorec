@@ -4,7 +4,7 @@ This seam exists so an evdev/uinput backend can be added later, for Wayland or f
 machine where `input` group membership has been granted, without the parser, the
 timeline or the GUI knowing about it.
 
-Subclasses implement the six primitives. `perform()` is shared: dispatching an Event
+Subclasses implement the seven primitives. `perform()` is shared: dispatching an Event
 to primitives is the same work whatever is on the other end.
 """
 
@@ -22,6 +22,7 @@ from ..events import (
     MouseDown,
     MouseUp,
     Move,
+    MoveRel,
     Scroll,
     Sleep,
     TypeText,
@@ -69,6 +70,8 @@ class Player(ABC):
                 self.key_up(tap.sym)
         elif isinstance(event, Move):
             self.move(event.x, event.y)
+        elif isinstance(event, MoveRel):
+            self.move_rel(event.dx, event.dy)
         elif isinstance(event, Click):
             self.button_down(event.button)
             self.button_up(event.button)
@@ -94,6 +97,10 @@ class Player(ABC):
 
     @abstractmethod
     def move(self, x: int, y: int) -> None:
+        ...
+
+    @abstractmethod
+    def move_rel(self, dx: int, dy: int) -> None:
         ...
 
     @abstractmethod

@@ -80,6 +80,23 @@ class Move(Event):
 
 
 @dataclass(frozen=True)
+class MoveRel(Event):
+    """A relative pointer displacement, from XI2 raw input (`backend/xi2.py`).
+
+    Deliberately not a `Move` subclass: `collapse.collapse_motion` and
+    `collapse.sample_motion` both test `isinstance(event, Move)` to find pointer
+    motion, and collapsing a run of deltas to its last one would silently discard
+    every delta before it - the opposite of what `collapse.accumulate_motion`
+    exists to prevent. `MOUSE_EVENTS` deliberately excludes it too: that tuple
+    means "an action that justifies keeping a preceding move", and `MoveRel` is
+    motion, not an action.
+    """
+
+    dx: int
+    dy: int
+
+
+@dataclass(frozen=True)
 class Click(Event):
     button: str = "left"
 

@@ -11,6 +11,7 @@ from macrorec.events import (
     MouseDown,
     MouseUp,
     Move,
+    MoveRel,
     Scroll,
     Sleep,
     TypeText,
@@ -23,14 +24,15 @@ def test_perform_dispatches_every_event_kind():
     player = FakePlayer()
     for event in [
         KeyTap("a"), KeyDown("Control_L"), KeyUp("Control_L"),
-        Move(10, 20), Click("left"), MouseDown("right"), MouseUp("right"),
-        Scroll("down", 3),
+        Move(10, 20), MoveRel(-5, 8), Click("left"), MouseDown("right"),
+        MouseUp("right"), Scroll("down", 3),
     ]:
         player.perform(event)
     assert player.calls == [
         ("key_down", "a"), ("key_up", "a"),
         ("key_down", "Control_L"), ("key_up", "Control_L"),
         ("move", 10, 20),
+        ("move_rel", -5, 8),
         ("button_down", "left"), ("button_up", "left"),
         ("button_down", "right"), ("button_up", "right"),
         ("scroll", "down"), ("scroll", "down"), ("scroll", "down"),

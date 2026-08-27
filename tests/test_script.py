@@ -9,6 +9,7 @@ from macrorec.events import (
     MouseDown,
     MouseUp,
     Move,
+    MoveRel,
     Scroll,
     Sleep,
     TypeText,
@@ -146,6 +147,8 @@ def test_string_escapes_round_trip():
         ("key a b\n", "exactly one key name"),
         ("move 1\n", "an x and a y"),
         ("move a b\n", "integer coordinates"),
+        ("moverel 1\n", "a dx and a dy"),
+        ("moverel a b\n", "integer deltas"),
         ("click sideways\n", "unknown button"),
         ("scroll\n", "needs a direction"),
         ("scroll sideways\n", "unknown scroll direction"),
@@ -181,3 +184,14 @@ def test_error_message_carries_the_right_line_number():
 
 def test_empty_macro_formats_and_reparses():
     assert parse(format_macro(Macro())) == Macro()
+
+
+def test_moverel_parses_signed_deltas():
+    macro = parse("moverel -10 20\n")
+    assert macro.events == [MoveRel(-10, 20)]
+
+
+@pytest.mark.parametrize("dx, dy", [(-10, 20), (0, 0), (-1, -1), (5000, -5000)])
+def test_moverel_round_trips_negative_deltas(dx, dy):
+    macro = Macro(events=[MoveRel(dx, dy)])
+    assert parse(format_macro(macro)) == macro
